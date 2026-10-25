@@ -19,6 +19,10 @@ import ai.pleos.playground.vehicle.api.model.area.SeatArea;
 import ai.pleos.playground.vehicle.constant.area.SeatValue;
 import ai.pleos.playground.vehicle.constant.control.MoveControl;
 import ai.pleos.playground.vehicle.constant.unit.TemperatureUnit;
+import ai.pleos.playground.vehicle.api.model.area.WindowArea;
+import ai.pleos.playground.vehicle.api.model.capability.AreaBounds;
+import ai.pleos.playground.vehicle.constant.area.WindowValue;
+import ai.pleos.playground.vehicle.constant.control.WiperState;
 import kotlin.Unit;
 import android.view.Gravity;
 import android.view.View;
@@ -75,7 +79,8 @@ public class MainActivity extends Activity {
     SeatArea acArea = null, fanArea = null, powerArea = null;   // 차량이 지원하는 공조 영역 (기능 확인으로 채움)
 
     // ---- 화면 요소 ----
-    TextView hrValue, hrvValue, sleepValue, driveValue, speedValue, restValue;
+    TextView hrValue, hrvValue, sleepValue, driveValue, speedValue, restValue, tempValue, tempLabel;
+    LinearLayout tempCard;
     TextView scoreValue, scoreLabel, statusLine, ttsState, logView;
     View scoreBar;
     FrameLayout scoreTrack;
@@ -146,12 +151,41 @@ public class MainActivity extends Activity {
             vehicle.initialize();
             vehicleReady = true;
             handler.postDelayed(this::probeHvacAreas, 1200);
+            handler.postDelayed(this::probeWeather, 1400);
         } catch (Exception e) {
             updateLinkState("차량 연결 실패: " + e.getMessage());
         }
         updateLinkState(null);
         render();
         handler.postDelayed(this::start, 1500);
+    }
+
+    // 영상 제작용: adb로 문장을 보내면 Pleos 음성으로 읽기 (am start --es say "문장")
+    @Override
+    protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        String t = intent.getStringExtra("say");
+        if (t != null) { running = false; handler.removeCallbacks(tick); speak(t); }
+        // 시험용: 날씨 바꾸기 (am start --es weather rain | dust | clear)
+        String w = intent.getStringExtra("weather");
+        if (w != null) { raining = w.equals("rain"); pm25 = w.equals("dust") ? 80 : 18; addLog("시험: 날씨 = " + w); }
+        String s = intent.getStringExtra("synth");
+        if (s != null) synthToFiles(s);
+    }
+
+    // 영상 제작용: Pleos 음성을 파일로 저장 ("이름=문장|이름=문장")
+    private android.speech.tts.TextToSpeech sysTts;
+    private void synthToFiles(String spec) {
+        sysTts = new android.speech.tts.TextToSpeech(this, st -> {
+            android.util.Log.i("MalloSynth", "init " + st + " engines=" + sysTts.getEngines());
+            sysTts.setLanguage(java.util.Locale.KOREA);
+            for (String item : spec.split("\\|")) {
+                String[] kv = item.split("=", 2);
+                java.io.File f = new java.io.File(getExternalFilesDir(null), kv[0] + ".wav");
+                int r = sysTts.synthesizeToFile(kv[1], new Bundle(), f, kv[0]);
+                android.util.Log.i("MalloSynth", kv[0] + " -> " + r + " " + f);
+            }
+        }, "ai.pleos.playground.caas");
     }
 
     @Override
@@ -168,6 +202,14 @@ public class MainActivity extends Activity {
         if (running) return;
         running = true;
         addLog("주행 시작 · 워치 연결됨 (시뮬레이션 데이터)");
+        // 데모 시작 상태: 공조 켜짐, 운전석 24°C (온도가 바뀌는 모습이 보이도록)
+        if (vehicleReady) handler.postDelayed(() -> {
+            try {
+                vehicle.getHVAC().setHvacPower(powerArea != null ? powerArea : driver, true, (x, v) -> Unit.INSTANCE, e -> Unit.INSTANCE);
+                handler.postDelayed(() -> vehicle.getHVAC().setHvacTemperature(driver, 24f, TemperatureUnit.CELSIUS,
+                        (x, v) -> { showTemp(v, false); return Unit.INSTANCE; }, e -> Unit.INSTANCE), 400);
+            } catch (Exception ignored) {}
+        }, 600);
         speak("출발합니다. 어젯밤 수면이 5시간 12분으로 짧았어요. 피곤하면 언제든 말씀해 주세요.");
         handler.post(tick);
     }
@@ -202,17 +244,25 @@ public class MainActivity extends Activity {
                 showAlert(score);
             } else if (score >= 50 && score < 75 && cautionBanner.getVisibility() != View.VISIBLE && !alertShown) {
                 cautionBanner.setVisibility(View.VISIBLE);
-                cautionText.setText("피로 신호가 조금씩 보여요. 창문을 열거나 환기해 보세요.");
                 addLog(minute + "분 · 주의 단계 (피로도 " + score + ")");
+                // 창문 살짝 열기는 묻지 않고 바로 한다. 단, 비·눈(와이퍼 작동) 또는 미세먼지 나쁨이면 열지 않는다.
+                boolean windowOk = !raining && pm25 <= 35;
+                String why = raining ? "비·눈이 와서" : "미세먼지가 나빠서";
+                if (windowOk) {
+                    openWindowSlightly();
+                    cautionText.setText("환기: 운전석 창문을 살짝 열었어요 (비·눈 없음 · 미세먼지 " + pm25 + "㎍/㎥ 좋음)");
+                } else {
+                    cautionText.setText("환기: " + why + " 창문은 열지 않았어요");
+                    addLog(minute + "분 · " + why + " 창문 열지 않음");
+                }
                 ask("피로 신호가 조금씩 보여요",
-                        "실내 온도를 21°C로 조금 낮춰 볼까요?",
-                        "피로 신호가 조금씩 보여요. 실내 온도를 조금 낮춰 볼까요?",
+                        (windowOk ? "환기되도록 창문을 살짝 열었어요.\n" : why + " 창문은 열지 않을게요.\n")
+                                + "실내 온도를 21°C로 조금 낮춰 볼까요?",
+                        "피로 신호가 조금씩 보여요. "
+                                + (windowOk ? "환기되도록 창문을 살짝 열게요. " : why + " 창문은 열지 않을게요. ")
+                                + "실내 온도도 조금 낮춰 볼까요?",
                         "낮춰 줘", "괜찮아요",
-                        () -> {
-                            addLog(minute + "분 · 운전자 동의 → 온도 21°C");
-                            if (vehicleReady) vehicle.getHVAC().setHvacTemperature(driver, 21f, TemperatureUnit.CELSIUS,
-                                    (a, v) -> ok("운전석 온도 " + v + "°C"), e -> fail("온도", e));
-                        },
+                        () -> { addLog(minute + "분 · 운전자 동의 → 온도 21°C"); stepTemp(24, 21); },
                         () -> addLog(minute + "분 · 운전자 거절 → 변경 없음"));
             }
             if (running) handler.postDelayed(this, tickMs);
@@ -345,8 +395,7 @@ public class MainActivity extends Activity {
         try {
             vehicle.getHVAC().setHvacAc(acArea != null ? acArea : driver, true,
                     (a, v) -> ok("에어컨 켜짐"), e -> fail("에어컨", e));
-            vehicle.getHVAC().setHvacTemperature(driver, 20f, TemperatureUnit.CELSIUS,
-                    (a, v) -> ok("운전석 온도 " + v + "°C"), e -> fail("온도", e));
+            stepTemp(21, 20);
             vehicle.getSeat().setHvacSeatTemperature(driver, 0,
                     (a, v) -> ok("시트 열선 끔"), e -> fail("시트 열선", e));
             vehicle.getSeat().setHvacSeatVentilation(driver, 2,
@@ -392,6 +441,68 @@ public class MainActivity extends Activity {
         } catch (Exception e) { addLog("차량 제어 오류: " + e.getMessage()); }
     }
 
+    /** 온도를 1°C씩 차례로 내린다 (24 → 23 → 22 → 21). 차량에 실제로 한 단계씩 설정한다. */
+    void stepTemp(int from, int to) {
+        if (!vehicleReady) return;
+        int dir = to < from ? -1 : 1;
+        int n = Math.abs(to - from);
+        for (int i = 1; i <= n; i++) {
+            final float t = from + dir * i;
+            final boolean last = i == n;
+            handler.postDelayed(() -> vehicle.getHVAC().setHvacTemperature(driver, t, TemperatureUnit.CELSIUS,
+                    (a, v) -> { showTemp(v, true); return last ? ok("운전석 온도 " + from + "°C → " + v + "°C") : Unit.INSTANCE; },
+                    e -> fail("온도", e)), 900L * i);
+        }
+    }
+
+    // ---- 창문 환기 ----
+    boolean raining = false;   // 와이퍼가 작동 중이면 비·눈으로 판단 (차량 정보)
+    int pm25 = 18;             // 바깥 미세먼지(PM2.5, ㎍/㎥). 출시 버전은 에어코리아 API — 데모는 시뮬레이션
+    final WindowArea driverWindow = new WindowArea(WindowValue.ROW_1_LEFT);
+    int windowMin = 0, windowMax = 100;
+
+    void probeWeather() {
+        try {
+            vehicle.getWiper().getCurrentWiperState(new WindowArea(WindowValue.FRONT_WINDSHIELD),
+                    s -> { raining = s == WiperState.ON; return Unit.INSTANCE; }, e -> Unit.INSTANCE);
+        } catch (Exception ignored) {}
+        try {
+            vehicle.getWindow().checkWindowPositionCapabilities(
+                    (java.util.Map<WindowArea, AreaBounds<Integer>> m) -> {
+                        AreaBounds<Integer> b = m == null ? null : m.get(driverWindow);
+                        if (b == null && m != null && !m.isEmpty()) b = m.values().iterator().next();
+                        if (b != null) { windowMin = b.getMinValue(); windowMax = b.getMaxValue(); }
+                        return Unit.INSTANCE;
+                    }, e -> Unit.INSTANCE);
+        } catch (Exception ignored) {}
+    }
+
+    void openWindowSlightly() {
+        addLog(minute + "분 · 환기: 창문 살짝 열기 (묻지 않는 예외 — 비·눈·미세먼지 나쁨일 땐 안 함)");
+        if (!vehicleReady) return;
+        int pos = windowMin + Math.max(1, (windowMax - windowMin) * 15 / 100);
+        try {
+            vehicle.getWindow().setWindowPosition(driverWindow, pos,
+                    (a, v) -> ok("운전석 창문 살짝 열림 (" + v + ")"), e -> fail("창문", e));
+        } catch (Exception e) { addLog("창문 제어 오류: " + e.getMessage()); }
+    }
+
+    void showTemp(float v, boolean changed) {
+        runOnUiThread(() -> {
+            tempValue.setText(String.valueOf(Math.round(v)));
+            if (changed) {
+                tempCard.setBackground(roundStroke(Color.parseColor("#12233F"), ACCENT, 28));
+                tempValue.setTextColor(ACCENT);
+                tempLabel.setText("운전석 온도 (차량) · 방금 변경됨");
+                handler.postDelayed(() -> {
+                    tempCard.setBackground(round(CARD, 28));
+                    tempValue.setTextColor(INK);
+                    tempLabel.setText("운전석 온도 (차량)");
+                }, 6000);
+            }
+        });
+    }
+
     Unit ok(String what) { runOnUiThread(() -> addLog("차량 ✓ " + what)); return Unit.INSTANCE; }
     Unit fail(String what, Exception e) {
         runOnUiThread(() -> addLog("차량 ✗ " + what + " (" + (e == null ? "" : e.getClass().getSimpleName() + ": " + e.getMessage()) + ")"));
@@ -425,7 +536,7 @@ public class MainActivity extends Activity {
         hrvValue.setText(String.valueOf((int) Math.round(hrv)));
         sleepValue.setText("5h 12m");
         driveValue.setText((minute / 60) + "h " + (minute % 60) + "m");
-        speedValue.setText(running || minute > 0 ? "100" : "0");
+        if (tempValue.getText().length() == 0 || "-".contentEquals(tempValue.getText())) tempValue.setText("--");
         restValue.setText((int) Math.round(restAreaKm) + "km");
 
         int score = fatigueScore();
@@ -498,7 +609,10 @@ public class MainActivity extends Activity {
         hrvValue = metric(r1, "심박변이도 (워치)", "ms", 24);
         sleepValue = metric(r2, "어젯밤 수면 (워치)", "", 0);
         driveValue = metric(r2, "연속 주행", "", 24);
-        speedValue = metric(r3, "속도 (차량)", "km/h", 0);
+        tempValue = metric(r3, "운전석 온도 (차량)", "°C", 0);
+        tempCard = (LinearLayout) tempValue.getParent().getParent();
+        tempLabel = (TextView) tempCard.getChildAt(0);
+        speedValue = new TextView(this);
         restValue = metric(r3, "다음 휴게소 (내비)", "", 24);
 
         // 가운데: 피로도
